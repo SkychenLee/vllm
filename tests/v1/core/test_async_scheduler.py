@@ -279,6 +279,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
         lambda request, new_token_ids: new_token_ids
     )
     scheduler.requests = {request.request_id: request}
+    scheduler._pending_outputs = {}
     scheduler.running = [request]
     scheduler.waiting = Mock()
     scheduler.kv_cache_manager = Mock()
@@ -538,7 +539,10 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
 
     def counting_preempt(request, timestamp, **kwargs):
         nonlocal preempts_with_inflight_output
-        if request.num_in_flight_tokens > 0:
+        if any(
+            request.request_id in output.num_scheduled_tokens
+            for output, _ in engine.queue
+        ):
             preempts_with_inflight_output += 1
         return orig_preempt(request, timestamp, **kwargs)
 

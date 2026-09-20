@@ -277,7 +277,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_in_flight_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             num_prefill_lookahead=self.num_prefill_lookahead,
@@ -329,6 +329,8 @@ class Scheduler(SchedulerInterface):
         # is called once per scheduled step in FIFO order, so these stay in sync.
         self.sched_step_seq = 0
         self.processed_step_seq = 0
+        # Retain pending batches for async preemption recovery.
+        self._pending_outputs: dict[int, SchedulerOutput] = {}
         # FIFO of (fence_seq, blocks): blocks become safe to free once
         # processed_step_seq >= fence_seq.
         self.deferred_frees: deque[tuple[int, list[KVCacheBlock]]] = deque()
@@ -1359,14 +1361,17 @@ class Scheduler(SchedulerInterface):
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
-        # its share in update_from_output. num_in_flight_tokens already
-        # includes any undrained stale share, so assign rather than accumulate.
+        # its share in update_from_output. Pending batches include undrained
+        # stale output, so assign rather than accumulate.
         # An undrained drop-mode share stays dropped: its positions have
         # already been resampled.
         request.drop_stale_output = drop_stale_output or (
             request.drop_stale_output and request.num_stale_output_tokens > 0
         )
-        request.num_stale_output_tokens = request.num_in_flight_tokens
+        request.num_stale_output_tokens = sum(
+            output.num_scheduled_tokens.get(request.request_id, 0)
+            for output in self._pending_outputs.values()
+        )
         request.num_output_placeholders = 0
         request.num_preemptions += 1
         if self.log_stats:
@@ -1387,10 +1392,11 @@ class Scheduler(SchedulerInterface):
         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
         #    computed tokens will be adjusted in update_from_output.
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        if num_scheduled_tokens:
+            self._pending_outputs[id(scheduler_output)] = scheduler_output
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
-            request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
                 request.last_sched_seq = self.sched_step_seq
@@ -1735,6 +1741,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._pending_outputs.pop(id(scheduler_output), None)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -1798,13 +1805,11 @@ class Scheduler(SchedulerInterface):
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             output_is_stale = False
-            if request is not None:
-                request.num_in_flight_tokens -= num_tokens_scheduled
+            if request is not None and request.num_stale_output_tokens > 0:
                 # Drain any stale share (see _preempt_request) in lockstep.
-                if request.num_stale_output_tokens > 0:
-                    output_is_stale = True
-                    request.num_stale_output_tokens -= num_tokens_scheduled
-                    assert request.num_stale_output_tokens >= 0
+                output_is_stale = True
+                request.num_stale_output_tokens -= num_tokens_scheduled
+                assert request.num_stale_output_tokens >= 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue

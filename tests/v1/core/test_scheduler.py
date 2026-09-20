@@ -3269,6 +3269,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
         lambda request, new_token_ids: new_token_ids
     )
     scheduler.requests = {request.request_id: request}
+    scheduler._pending_outputs = {}
     scheduler.running = [request]
     scheduler.waiting = Mock()
     scheduler.kv_cache_manager = Mock()

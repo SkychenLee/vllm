@@ -560,16 +560,6 @@ class VllmConfig:
         return pp_size
 
     @property
-    def max_in_flight_tokens(self) -> int:
-        # Upper bound on tokens that are scheduled but not yet settled (freed):
-        # every concurrent batch may hold up to a full `max_num_batched_tokens`.
-        # Kept for callers tracking overlapping work. KV admission uses the
-        # legacy single-batch budget instead.
-        return (
-            self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
-        )
-
-    @property
     def num_speculative_tokens(self) -> int:
         if (
             self.speculative_config is not None

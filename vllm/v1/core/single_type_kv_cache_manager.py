@@ -1434,8 +1434,11 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
-        # Async scheduling can count speculative tokens before their rejection.
-        # Keep the legacy guard when freeing from the optimistic token count.
+        # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
+        # draft tokens from the previous step that may or may not be rejected later.
+        # This can make us think we are further ahead in the sequence than we actually
+        # are, so let's assume that all tokens are rejected so we don't free blocks
+        # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
         super().remove_skipped_blocks(
@@ -1853,7 +1856,7 @@ class SinkFullAttentionManager(FullAttentionManager):
 
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
-    max_in_flight_tokens: int,
+    max_num_batched_tokens: int,
     max_model_len: int,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
@@ -1866,8 +1869,7 @@ def get_manager_for_kv_cache_spec(
 
     Args:
         kv_cache_spec: The KVCacheSpec instance
-        max_in_flight_tokens: Single-batch token budget for admission. The
-            parameter name is retained for caller compatibility.
+        max_num_batched_tokens: The maximum number of tokens in a batch
         max_model_len: The maximum context length the model could serve
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass
@@ -1888,7 +1890,7 @@ def get_manager_for_kv_cache_spec(
     ):
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=max_in_flight_tokens,
+                max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
             )
         )

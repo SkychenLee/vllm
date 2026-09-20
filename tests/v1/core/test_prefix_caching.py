@@ -3580,8 +3580,7 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
     manager = make_kv_cache_manager(
         config,
         max_model_len=max_model_len,
-        # Single (sync) batch in flight, so in-flight tokens == batched tokens.
-        max_in_flight_tokens=max_num_batched_tokens,
+        max_num_batched_tokens=max_num_batched_tokens,
         enable_caching=True,
         hash_block_size=block_size,
     )
@@ -3637,8 +3636,7 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     manager = make_kv_cache_manager(
         config,
         max_model_len=max_model_len,
-        # Single (sync) batch in flight, so in-flight tokens == batched tokens.
-        max_in_flight_tokens=max_num_batched_tokens,
+        max_num_batched_tokens=max_num_batched_tokens,
         enable_caching=True,
         hash_block_size=block_size,
     )
