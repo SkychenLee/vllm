@@ -370,7 +370,7 @@ class KVCacheCoordinator(ABC):
     def remove_skipped_blocks(
         self,
         request_id: str,
-        processed_computed_tokens: int,
+        total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
         """
@@ -379,15 +379,15 @@ class KVCacheCoordinator(ABC):
 
         Args:
             request_id: The request ID.
-            processed_computed_tokens: Computed-token prefix length covering
-                fully processed and committed tokens only (safe to free).
+            total_computed_tokens: The total number of computed tokens, including
+                local computed tokens and external computed tokens.
             num_prompt_tokens: Optional prompt length. R-SWA managers use this to
                 free gap blocks between the prefill tail and decode window; other
                 manager types ignore it.
         """
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
+                request_id, total_computed_tokens, num_prompt_tokens
             )
 
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:

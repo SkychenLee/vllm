@@ -501,12 +501,9 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
-        # Free on the processed-token basis: in-flight steps' attention windows
-        # still read blocks below the optimistic boundary, and rejected spec
-        # tokens can roll it back.
         self.coordinator.remove_skipped_blocks(
             request.request_id,
-            max(0, total_computed_tokens - request.num_in_flight_tokens),
+            total_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
@@ -583,7 +580,7 @@ class KVCacheManager:
     def remove_skipped_blocks(
         self,
         request_id: str,
-        processed_computed_tokens: int,
+        total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
@@ -591,12 +588,12 @@ class KVCacheManager:
 
         Args:
             request_id: The request ID.
-            processed_computed_tokens: Computed-token prefix length covering
-                fully processed and committed tokens only (safe to free).
+            total_computed_tokens: The total number of computed tokens, including
+                local computed tokens and external computed tokens.
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
         self.coordinator.remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
+            request_id, total_computed_tokens, num_prompt_tokens
         )
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:

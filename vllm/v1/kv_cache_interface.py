@@ -506,11 +506,10 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         (`max_memory_usage_bytes`) and the runtime admission gate, so requests
         admitted by startup can also be admitted at runtime.
 
-        `max_in_flight_tokens` is the max tokens scheduled but not yet settled
-        (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`.
+        `max_in_flight_tokens` retains its name for caller compatibility but
+        receives the single-batch `max_num_batched_tokens` budget.
         """
-        # During chunked prefill, we hold KV for at most one chunk window plus
-        # the in-flight tokens, since frees happen on the processed-token basis.
+        # During chunked prefill, reserve one chunk window plus the next batch.
         num_tokens = min(
             self.attention_chunk_size + max_in_flight_tokens, max_model_len
         )
@@ -518,7 +517,7 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_blocks = self.max_admission_blocks_per_request(
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_in_flight_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
         )
         return max_blocks * self.page_size_bytes
@@ -554,13 +553,12 @@ class SlidingWindowSpec(AttentionSpec):
         `SlidingWindowManager.remove_skipped_blocks` runs from `allocate_slots`
         before each chunk's `get_num_blocks_to_allocate`.
 
-        `max_in_flight_tokens` is the max tokens scheduled but not yet settled
-        (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`.
+        `max_in_flight_tokens` retains its name for caller compatibility but
+        receives the single-batch `max_num_batched_tokens` budget.
         """
         # During chunked prefill, we hold KV for the last `sliding_window-1`
-        # computed tokens plus the in-flight tokens (frees happen on the
-        # processed-token basis); never more than `max_model_len`. An additional
-        # `extra_retained_tokens` trailing tokens are kept alive below the
+        # computed tokens plus the next batch; never more than `max_model_len`.
+        # Additional `extra_retained_tokens` are kept alive below the
         # window for multi-module spec decoding, and must be accounted here too.
         num_tokens = min(
             self.sliding_window - 1 + self.extra_retained_tokens + max_in_flight_tokens,
@@ -576,7 +574,7 @@ class SlidingWindowSpec(AttentionSpec):
             "DCP not support sliding window."
         )
         max_blocks = self.max_admission_blocks_per_request(
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_in_flight_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
         )
         return max_blocks * self.page_size_bytes

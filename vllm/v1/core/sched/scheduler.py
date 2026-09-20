@@ -277,7 +277,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_in_flight_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             num_prefill_lookahead=self.num_prefill_lookahead,
@@ -2675,12 +2675,10 @@ class Scheduler(SchedulerInterface):
             return False, None
 
         # Free any out-of-window prefix blocks before we hand the block table to
-        # the connector, on the processed-token basis (see `allocate_slots`).
+        # the connector.
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
-            processed_computed_tokens=max(
-                0, request.num_computed_tokens - request.num_in_flight_tokens
-            ),
+            total_computed_tokens=request.num_computed_tokens,
             num_prompt_tokens=request.num_prompt_tokens,
         )
 

@@ -624,7 +624,7 @@ class SingleTypeKVCacheManager(ABC):
     def remove_skipped_blocks(
         self,
         request_id: str,
-        processed_computed_tokens: int,
+        total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
         """
@@ -636,15 +636,15 @@ class SingleTypeKVCacheManager(ABC):
 
         Args:
             request_id: The request ID.
-            processed_computed_tokens: Computed-token prefix length covering
-                fully processed and committed tokens only (safe to free).
+            total_computed_tokens: The total number of computed tokens, including
+                local computed tokens and external computed tokens.
             num_prompt_tokens: Optional prompt length for attention types (e.g.
                 R-SWA) that evict a middle gap rather than a head prefix. Ignored
                 by the default implementation.
         """
         del num_prompt_tokens
         # Remove the blocks that will be skipped during attention computation.
-        num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         if num_skipped_tokens <= 0:
             # This indicates that ALL tokens are inside attention window.
             # Thus we do not need to free any blocks outside attention window.
@@ -847,14 +847,14 @@ class RSWAManager(FullAttentionManager):
     def remove_skipped_blocks(
         self,
         request_id: str,
-        processed_computed_tokens: int,
+        total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
         """Free gap blocks that are no longer needed for attention.
 
         Gap = blocks entirely within
             [ceil(prefix_len / block_size) * block_size,
-             max(prefix_len, processed_computed_tokens - rswa_window))
+             max(prefix_len, total_computed_tokens - rswa_window))
 
         Freed blocks are replaced with null_block in req_to_blocks so the
         block_table passed to FA4 is valid (null_block KV is all-zero;
@@ -862,7 +862,7 @@ class RSWAManager(FullAttentionManager):
         """
         if num_prompt_tokens is None:
             super().remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
+                request_id, total_computed_tokens, num_prompt_tokens
             )
             return
 
@@ -870,9 +870,7 @@ class RSWAManager(FullAttentionManager):
         # First block fully after the prefill boundary.
         first_gap_block = cdiv(num_prompt_tokens, bs)
         # Decode window start position; blocks before this are evictable.
-        window_start = max(
-            num_prompt_tokens, processed_computed_tokens - self.rswa_window
-        )
+        window_start = max(num_prompt_tokens, total_computed_tokens - self.rswa_window)
         last_gap_block = window_start // bs  # exclusive upper bound
         self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
@@ -1431,13 +1429,17 @@ class MambaManager(SingleTypeKVCacheManager):
     def remove_skipped_blocks(
         self,
         request_id: str,
-        processed_computed_tokens: int,
+        num_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        # Async scheduling can count speculative tokens before their rejection.
+        # Keep the legacy guard when freeing from the optimistic token count.
+        num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
+
         super().remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
+            request_id, num_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
@@ -1451,7 +1453,7 @@ class MambaManager(SingleTypeKVCacheManager):
             if (
                 last_state_block_idx is not None
                 and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
+                < cdiv(num_computed_tokens, self.block_size) - 1
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
@@ -1864,8 +1866,8 @@ def get_manager_for_kv_cache_spec(
 
     Args:
         kv_cache_spec: The KVCacheSpec instance
-        max_in_flight_tokens: The max tokens scheduled but not yet settled
-            (one batch per concurrent step); see `VllmConfig.max_in_flight_tokens`
+        max_in_flight_tokens: Single-batch token budget for admission. The
+            parameter name is retained for caller compatibility.
         max_model_len: The maximum context length the model could serve
     Returns:
         An instance of the appropriate SingleTypeKVCacheManager subclass

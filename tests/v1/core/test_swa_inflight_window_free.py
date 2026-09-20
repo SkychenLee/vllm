@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Out-of-window block frees vs in-flight GPU steps.
+"""Legacy out-of-window frees and single-batch KV admission bounds."""
 
-With async scheduling / PP, `num_computed_tokens` optimistically includes
-tokens of unprocessed steps whose attention windows still read the blocks
-just below the optimistic boundary (and rejected spec tokens can roll it
-back), so `allocate_slots` frees on the processed-token basis:
-`num_computed_tokens - num_in_flight_tokens`.
-"""
-
+import pytest
 import torch
 
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -24,7 +18,7 @@ SLIDING_WINDOW = 16
 # (100 - 16 + 1 = 85), i.e. 5 full blocks.
 NUM_OUT_OF_WINDOW_BLOCKS = 85 // BLOCK_SIZE
 # Chunked-local skips whole chunks left of the current one:
-# (100 // 32) * 32 = 96 settled tokens -> 6 full blocks.
+# (100 // 32) * 32 = 96 computed tokens -> 6 full blocks.
 CHUNK_SIZE = 32
 NUM_OUT_OF_CHUNK_BLOCKS = (NUM_PROMPT_TOKENS // CHUNK_SIZE) * CHUNK_SIZE // BLOCK_SIZE
 
@@ -95,9 +89,8 @@ def test_num_in_flight_tokens_accounting():
     assert request.num_in_flight_tokens == 0
 
 
-def test_swa_free_waits_for_in_flight_step():
-    """Async: out-of-window blocks stay allocated until the step that still
-    reads them has been processed."""
+def test_swa_free_uses_optimistic_computed_tokens():
+    """Async frees use scheduled tokens even before prefill output arrives."""
     scheduler = _create_swa_scheduler(async_scheduling=True)
     request = create_requests(
         num_requests=1, num_tokens=NUM_PROMPT_TOKENS, block_size=BLOCK_SIZE
@@ -109,25 +102,23 @@ def test_swa_free_waits_for_in_flight_step():
     out0 = scheduler.schedule()  # prefill, in flight from here on
     free_after_prefill = block_pool.get_num_free_blocks()
 
-    # Decode scheduled while the prefill still reads the out-of-window blocks:
-    # they must not be freed yet.
     out1 = scheduler.schedule()
-    assert _num_null_blocks(scheduler, req_id) == 0
-    assert block_pool.get_num_free_blocks() == free_after_prefill
-
-    # Prefill output processed; the next allocate frees the out-of-window
-    # blocks.
+    assert request.num_in_flight_tokens == NUM_PROMPT_TOKENS + 1
+    assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
+    assert (
+        block_pool.get_num_free_blocks()
+        == free_after_prefill + NUM_OUT_OF_WINDOW_BLOCKS
+    )
+    # Processing the outstanding outputs must not free those blocks again.
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.schedule()
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
     scheduler.schedule()
     assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
     assert (
         block_pool.get_num_free_blocks()
         == free_after_prefill + NUM_OUT_OF_WINDOW_BLOCKS
     )
-    # Not double-freed on the following steps.
-    scheduler.update_from_output(out1, _make_model_runner_output(out1))
-    scheduler.schedule()
-    assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
 
 
 def test_swa_free_immediate_when_sync():
@@ -148,30 +139,8 @@ def test_swa_free_immediate_when_sync():
     assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
 
 
-def test_swa_admission_cap_accounts_for_overlapping_batches():
-    spec = SlidingWindowSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        sliding_window=1024,
-    )
-    base = spec.max_admission_blocks_per_request(
-        max_in_flight_tokens=1024, max_model_len=16384
-    )
-    # (1024 - 1 + 1024) tokens -> 128 blocks, +1 for window misalignment.
-    assert base == 129
-    overlapped = spec.max_admission_blocks_per_request(
-        max_in_flight_tokens=2 * 1024, max_model_len=16384
-    )
-    # One extra in-flight chunk is held back: (1024 - 1 + 2 * 1024) tokens.
-    assert overlapped == 193
-
-
-def test_chunked_local_free_waits_for_in_flight_step():
-    """Chunked-local attention frees whole chunks left of the current one, and
-    is exposed to the same load-WAR: with async scheduling those chunks must
-    stay allocated until the in-flight step that still reads them settles."""
+def test_chunked_local_free_uses_optimistic_computed_tokens():
+    """Chunked-local frees also use the optimistic computed-token count."""
     scheduler = _create_chunked_scheduler(async_scheduling=True)
     request = create_requests(
         num_requests=1, num_tokens=NUM_PROMPT_TOKENS, block_size=BLOCK_SIZE
@@ -183,50 +152,77 @@ def test_chunked_local_free_waits_for_in_flight_step():
     out0 = scheduler.schedule()  # prefill, in flight from here on
     free_after_prefill = block_pool.get_num_free_blocks()
 
-    # Decode scheduled while the prefill still reads the out-of-chunk blocks.
     out1 = scheduler.schedule()
-    assert _num_null_blocks(scheduler, req_id) == 0
-    assert block_pool.get_num_free_blocks() == free_after_prefill
-
-    # Prefill output processed; the next allocate frees the out-of-chunk blocks.
+    assert request.num_in_flight_tokens == NUM_PROMPT_TOKENS + 1
+    assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_CHUNK_BLOCKS
+    assert (
+        block_pool.get_num_free_blocks() == free_after_prefill + NUM_OUT_OF_CHUNK_BLOCKS
+    )
+    # Processing the outstanding outputs must not free those blocks again.
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
+    scheduler.schedule()
+    scheduler.update_from_output(out1, _make_model_runner_output(out1))
     scheduler.schedule()
     assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_CHUNK_BLOCKS
     assert (
         block_pool.get_num_free_blocks() == free_after_prefill + NUM_OUT_OF_CHUNK_BLOCKS
     )
-    # Not double-freed on the following steps.
-    scheduler.update_from_output(out1, _make_model_runner_output(out1))
-    scheduler.schedule()
-    assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_CHUNK_BLOCKS
 
 
-def test_chunked_local_admission_cap_accounts_for_overlapping_batches():
-    spec = ChunkedLocalAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        attention_chunk_size=1024,
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    ("spec", "expected_blocks"),
+    [
+        (
+            SlidingWindowSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+            17,  # ceil((128 - 1 + 128) / 16) + 1
+        ),
+        (
+            ChunkedLocalAttentionSpec(
+                block_size=BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                attention_chunk_size=128,
+            ),
+            16,  # ceil((128 + 128) / 16)
+        ),
+    ],
+    ids=["sliding_window", "chunked_local"],
+)
+def test_startup_and_runtime_admission_use_single_batch(
+    spec, expected_blocks: int, async_scheduling: bool
+):
+    """A pool sized for one batch admits long prompts with either scheduler."""
+    scheduler = create_scheduler(
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=128,
+        max_model_len=2048,
+        num_blocks=expected_blocks + 1,  # Include the null block.
+        async_scheduling=async_scheduling,
+        kv_cache_spec=spec,
     )
-    base = spec.max_admission_blocks_per_request(
-        max_in_flight_tokens=1024, max_model_len=16384
+    assert (
+        spec.max_memory_usage_bytes(scheduler.vllm_config)
+        == expected_blocks * spec.page_size_bytes
     )
-    # (1024 + 1024) tokens -> 128 blocks.
-    assert base == 128
-    overlapped = spec.max_admission_blocks_per_request(
-        max_in_flight_tokens=2 * 1024, max_model_len=16384
+    request = create_requests(num_requests=1, num_tokens=1024, block_size=BLOCK_SIZE)[0]
+    assert (
+        scheduler.kv_cache_manager.allocate_slots(
+            request, 128, full_sequence_must_fit=True
+        )
+        is not None
     )
-    # One extra in-flight chunk is held back: (1024 + 2 * 1024) tokens.
-    assert overlapped == 192
 
 
-def test_connector_finish_frees_on_settled_basis():
-    """The out-of-window prune done at request finish, before the block table
-    is handed to a KV connector (simple CPU offload / NIXL store), must use the
-    same processed-token basis. Otherwise the connector reads/hands off a block
-    the still-in-flight step is optimistically counted as done with, which is
-    the load-path WAR this fix closes."""
+def test_connector_finish_frees_on_optimistic_basis():
+    """Connector handoff prunes without waiting for prefill output."""
     scheduler = create_scheduler(
         block_size=BLOCK_SIZE,
         async_scheduling=True,
@@ -246,14 +242,13 @@ def test_connector_finish_frees_on_settled_basis():
     req_id = request.request_id
 
     out0 = scheduler.schedule()  # prefill, in flight from here on
-    scheduler.schedule()  # decode over-scheduled: num_computed_tokens optimistic
-
-    # Finishing now (connector store) must NOT prune out-of-window blocks the
-    # in-flight prefill still reads.
-    scheduler._connector_finished(request)
+    assert request.num_in_flight_tokens == NUM_PROMPT_TOKENS
     assert _num_null_blocks(scheduler, req_id) == 0
 
-    # Once the in-flight step settles, the same prune releases them.
+    scheduler._connector_finished(request)
+    assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
+
+    # Pruning after output processing remains idempotent.
     scheduler.update_from_output(out0, _make_model_runner_output(out0))
     scheduler._connector_finished(request)
     assert _num_null_blocks(scheduler, req_id) == NUM_OUT_OF_WINDOW_BLOCKS
