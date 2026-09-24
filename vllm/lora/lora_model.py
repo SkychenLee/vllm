@@ -127,6 +127,8 @@ class LoRAModel:
     ) -> "LoRAModel":
         """Create a LoRAModel from a dictionary of tensors."""
         pin_memory = str(device) == "cpu" and PIN_MEMORY
+        # Temporarily bypass LoRA host pinning after aclrtMallocHostWithCfg OOM.
+        pin_memory = False
         loras: dict[str, LoRALayerWeights] = {}
         for tensor_name, tensor in tensors.items():
             if is_base_embedding_weights(tensor_name):
