@@ -444,6 +444,11 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         is_available_online=False,
     ),
     "Ministral3ForCausalLM": _HfExamplesInfo("mistralai/Ministral-3-3B-Instruct-2512"),
+    "Mistral4ForCausalLM": _HfExamplesInfo(
+        "mistralai/Mistral-Small-4-119B-2603",
+        tokenizer_mode="mistral",
+        min_transformers_version="5.3.0",
+    ),
     "MistralForCausalLM": _HfExamplesInfo("mistralai/Mistral-7B-Instruct-v0.1"),
     "MistralLarge3ForCausalLM": _HfExamplesInfo(
         "mistralai/Mistral-Large-3-675B-Instruct-2512-NVFP4"

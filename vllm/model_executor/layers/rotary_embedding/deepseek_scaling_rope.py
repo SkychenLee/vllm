@@ -44,14 +44,19 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbeddingBase):
         mscale: float = 1,
         mscale_all_dim: float = 0,
         init_cache: bool = True,
+        attention_factor: float | None = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
         # Get n-d magnitude scaling corrected for interpolation.
-        self.mscale = float(
-            yarn_get_mscale(self.scaling_factor, float(mscale))
-            / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
+        self.mscale = (
+            float(attention_factor)
+            if attention_factor is not None
+            else float(
+                yarn_get_mscale(self.scaling_factor, float(mscale))
+                / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
+            )
         )
         self.use_flashinfer = (
             self.enabled()

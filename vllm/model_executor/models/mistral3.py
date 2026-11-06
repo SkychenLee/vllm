@@ -37,6 +37,8 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers.mistral import MistralTokenizer
+from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import (
@@ -228,6 +230,17 @@ class Mistral3ProcessingInfo(BaseProcessingInfo):
         return Mistral3HFEncoderInfo(self.get_hf_config(), image_size)
 
     def get_hf_processor(self, **kwargs: object):
+        tokenizer = self.ctx.get_tokenizer()
+        if isinstance(tokenizer, MistralTokenizer) and tokenizer.version >= 15:
+            # Tekken control tokens go through the instruct protocol. The HF
+            # processor needs the checkpoint tokenizer for raw [IMG] expansion.
+            merged_kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+            merged_kwargs.pop("tokenizer", None)
+            return cached_processor_from_config(
+                self.ctx.model_config,
+                processor_cls=PixtralProcessor,
+                **merged_kwargs,
+            )
         return self.ctx.get_hf_processor(PixtralProcessor, **kwargs)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
@@ -484,9 +497,15 @@ class Mistral3ForConditionalGeneration(
             )
 
         with self._mark_language_model(vllm_config):
+            architectures = (
+                ["Mistral4ForCausalLM"]
+                if config.text_config.model_type == "mistral4"
+                else None
+            )
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
+                architectures=architectures,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
 

@@ -37,6 +37,7 @@ class _SpeculativeConfig:
     moe_backend: str | None = None
     kv_cache_dtype: str | None = None
     draft_model_config: object = None
+    draft_load_config: LoadConfig | None = None
 
 
 @dataclass
@@ -95,3 +96,12 @@ def test_override_does_not_mutate_the_target_config():
     cfg = _config("FLASHINFER", "TRITON_ATTN")
     _capture_draft_config(cfg)
     assert cfg.attention_config.backend == "FLASHINFER"
+
+
+def test_native_draft_load_format_overrides_hf_target_without_mutation():
+    cfg = _config("FLASHINFER", None)
+    cfg.load_config = LoadConfig(load_format="safetensors")
+    cfg.speculative_config.draft_load_config = LoadConfig(load_format="mistral")
+    used = _capture_draft_config(cfg)
+    assert used.load_config.load_format == "mistral"
+    assert cfg.load_config.load_format == "safetensors"

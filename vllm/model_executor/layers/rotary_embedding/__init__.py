@@ -290,6 +290,7 @@ def get_rope(
                 "beta_slow",
                 "mscale",
                 "mscale_all_dim",
+                "attention_factor",
             )
         }
         if rope_parameters.get("is_deepseek_v4", False):

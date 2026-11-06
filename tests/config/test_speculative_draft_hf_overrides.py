@@ -185,3 +185,33 @@ def test_mtp_index_share_override(
         speculative_config.draft_model_config.hf_config.index_share_for_mtp_iteration
         is expected
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft_format", [None, "mistral", "auto"])
+def test_draft_config_format_can_differ_from_target(draft_format):
+    draft = MagicMock(
+        model="draft",
+        max_model_len=128,
+        hf_config=_make_hf_config(
+            architectures=["Qwen4ExpMTP"], model_type="qwen4_exp_mtp", n_predict=1
+        ),
+    )
+    target = MagicMock(
+        model="target",
+        max_model_len=128,
+        quantization=None,
+        hf_overrides={},
+        config_format="hf",
+    )
+    with patch("vllm.config.speculative.ModelConfig", return_value=draft) as loader:
+        SpeculativeConfig(
+            model="draft",
+            method="mtp",
+            num_speculative_tokens=1,
+            draft_config_format=draft_format,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )
+    assert loader.call_args.kwargs["config_format"] == (draft_format or "hf")
+    assert target.config_format == "hf"

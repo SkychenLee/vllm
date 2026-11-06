@@ -16,7 +16,7 @@ from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.config import ConfigFormat, get_hf_text_config
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -513,6 +513,11 @@ class SpeculativeConfig:
     draft_load_config: LoadConfig | None = None
     """Load config for the draft model. If not specified, will use the load
     config from the target model."""
+
+    draft_config_format: ConfigFormat | None = None
+    """Configuration format for the draft model. If unset, inherit the target
+    format. This can differ from draft_load_config.load_format, which selects
+    the checkpoint weights rather than the configuration file."""
 
     rejection_sample_method: RejectionSampleMethod = "standard"
     """The rejection sampling method to use. 'standard' uses probabilistic
@@ -1289,7 +1294,11 @@ class SpeculativeConfig:
                     enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
-                    config_format=self.target_model_config.config_format,
+                    config_format=(
+                        self.draft_config_format
+                        if self.draft_config_format is not None
+                        else self.target_model_config.config_format
+                    ),
                 )
 
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
