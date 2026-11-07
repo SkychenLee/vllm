@@ -193,6 +193,21 @@ def parse_fine_tuned_lora_name(
     start_index = 2 if name.startswith("base_model.model.") else 0
 
     parts = name.split(".")
+    # PEFT state_dict exports may retain the default adapter's ModuleDict key.
+    # Only normalize that suffix; other adapter names must not be mixed in.
+    if (
+        len(parts) >= 3
+        and parts[-3] in ("lora_A", "lora_B")
+        and parts[-2:] == ["default", "weight"]
+    ):
+        parts.pop(-2)
+    elif (
+        len(parts) >= 2
+        and parts[-2] in ("lora_embedding_A", "lora_embedding_B")
+        and parts[-1] == "default"
+    ):
+        parts.pop()
+
     if (
         parts[-1] == "weight"
         and len(parts) >= 2

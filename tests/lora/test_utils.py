@@ -112,6 +112,37 @@ def test_parse_fine_tuned_lora_name_invalid():
             parse_fine_tuned_lora_name(name)
 
 
+@pytest.mark.parametrize("side", ["A", "B"])
+@pytest.mark.parametrize("embedding", [False, True])
+@pytest.mark.parametrize("peft_prefix", ["", "base_model.model."])
+def test_parse_default_adapter_name(side, embedding, peft_prefix):
+    module = "model.default.layers.0.mlp.shared_experts.down_proj"
+    parameter = f"lora_embedding_{side}" if embedding else f"lora_{side}"
+    suffix = "" if embedding else ".weight"
+    mapper = WeightsMapper(orig_to_new_prefix={"model.": "language_model.model."})
+    name = f"{peft_prefix}{module}.{parameter}.default{suffix}"
+    assert parse_fine_tuned_lora_name(name, mapper) == (
+        "language_model.model.default.layers.0.mlp.shared_experts.down_proj",
+        side == "A",
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "lora_A.other.weight",
+        "lora_A.default.extra.weight",
+        "lora_A.default.bias",
+        "lora_embedding_A.other",
+        "lora_embedding_A.default.weight",
+    ],
+)
+def test_parse_default_adapter_rejects_other_names_and_invalid_suffixes(suffix):
+    name = f"language_model.model.layers.0.mlp.shared_experts.down_proj.{suffix}"
+    with pytest.raises(ValueError, match="unsupported LoRA weight"):
+        parse_fine_tuned_lora_name(name)
+
+
 def test_replace_submodule():
     model = nn.Sequential(
         OrderedDict(

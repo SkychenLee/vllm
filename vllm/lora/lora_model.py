@@ -142,6 +142,14 @@ class LoRAModel:
                     module_name, peft_helper
                 )
 
+            lora_attribute = "lora_a" if is_lora_a else "lora_b"
+            if getattr(loras[module_name], lora_attribute) is not None:
+                raise ValueError(
+                    f"Duplicate LoRA weight {tensor_name}: "
+                    f"{module_name}.{lora_attribute} is already loaded. "
+                    "Export a single adapter without duplicate weight names."
+                )
+
             if is_lora_a:
                 if (
                     "lora_embedding_A" in tensor_name

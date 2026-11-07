@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import parse_fine_tuned_lora_name
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.mistral3 import Mistral3ForConditionalGeneration
 from vllm.model_executor.models.utils import WeightsMapper
 
 lora_lst = ["baichuan7B", "baichuan7B-zero", "baichuan7B-zero-regex", "chatglm3-6b"]
@@ -154,3 +159,62 @@ def test_gemma4_moe_lora_weights_mapping():
         "model.layers.9.moe.gate_up_proj",
         False,
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("file_format", ["safetensors", "bin"])
+@pytest.mark.parametrize("adapter_suffix", ["", ".default"])
+@pytest.mark.parametrize(
+    "prefix", ["language_model.model.", "base_model.model.model.language_model."]
+)
+def test_load_shared_expert_lora_with_default_adapter_name(
+    tmp_path, file_format, adapter_suffix, prefix
+):
+    """Load the reported shared-expert keys without changing tensors or scaling."""
+    targets = {"gate_proj", "up_proj", "down_proj"}
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps({"r": 2, "lora_alpha": 4, "target_modules": sorted(targets)})
+    )
+    a = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    b = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    tensors = {
+        f"{prefix}layers.0.mlp.shared_experts.{target}.lora_{side}"
+        f"{adapter_suffix}.weight": tensor.clone()
+        for target in targets
+        for side, tensor in (("A", a), ("B", b))
+    }
+    checkpoint = tmp_path / f"adapter_model.{file_format}"
+    if file_format == "safetensors":
+        save_file(tensors, str(checkpoint))
+    else:
+        torch.save(tensors, checkpoint)
+
+    peft_helper = PEFTHelper.from_local_dir(str(tmp_path), max_position_embeddings=None)
+    model = LoRAModel.from_local_checkpoint(
+        str(tmp_path),
+        expected_lora_modules=targets,
+        peft_helper=peft_helper,
+        lora_model_id=1,
+        device="cpu",
+        dtype=torch.bfloat16,
+        weights_mapper=Mistral3ForConditionalGeneration.hf_to_vllm_mapper,
+    )
+    assert len(model.loras) == 3
+    for target in targets:
+        lora = model.loras[f"language_model.model.layers.0.mlp.shared_experts.{target}"]
+        assert lora.scaling == 2
+        torch.testing.assert_close(lora.lora_a, a.to(torch.bfloat16))
+        torch.testing.assert_close(lora.lora_b, b.to(torch.bfloat16))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("side", ["A", "B"])
+def test_default_adapter_aliases_cannot_overwrite_lora_weights(side):
+    module = "language_model.model.layers.0.mlp.shared_experts.down_proj"
+    tensors = {
+        f"{module}.lora_{side}.weight": torch.ones(2, 2),
+        f"{module}.lora_{side}.default.weight": torch.zeros(2, 2),
+    }
+    peft_helper = PEFTHelper(r=2, lora_alpha=4, target_modules=["down_proj"])
+    with pytest.raises(ValueError, match="Duplicate LoRA weight"):
+        LoRAModel.from_lora_tensors(1, tensors, peft_helper, device="cpu")
