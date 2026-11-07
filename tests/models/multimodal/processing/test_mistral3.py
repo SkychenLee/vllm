@@ -4,6 +4,9 @@
 
 import pytest
 import torch
+from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
+from mistral_common.protocol.instruct.messages import UserMessage
+from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from PIL import Image
 from transformers import BatchFeature
 
@@ -11,7 +14,10 @@ from vllm.model_executor.models.lightonocr import LightOnOCRProcessingInfo
 from vllm.model_executor.models.mistral3 import Mistral3HFEncoderInfo
 from vllm.model_executor.models.pixtral import PixtralHFEncoderInfo
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import MultiModalProcessorOnlyCache
 from vllm.multimodal.inputs import MultiModalKwargsItems
+from vllm.multimodal.processing import ProcessorInputs, TimingContext
+from vllm.tokenizers.mistral import MistralTokenizer
 
 from ...utils import build_model_context
 
@@ -19,6 +25,7 @@ from ...utils import build_model_context
 # selects PixtralForConditionalGeneration; force HF to exercise Mistral3.
 _MODEL_CONFIG_KWARGS = {"config_format": "hf"}
 _MODEL_ID = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+_MISTRAL4_MODEL_ID = "mistralai/Mistral-Small-4-119B-2603"
 _LIGHTON_MODEL_ID = "lightonai/LightOnOCR-1B-1025"
 
 
@@ -141,3 +148,101 @@ def test_lightonocr_keeps_vision_config_image_size():
     assert encoder_info.get_image_size() == (
         processor.info.get_hf_config().vision_config.image_size
     )
+
+
+def _assert_image_features_match_placeholders(processor, output, num_images: int):
+    placeholders = output["mm_placeholders"].get("image", [])
+    image_kwargs = output["mm_kwargs"].get("image", [])
+    assert len(placeholders) == len(image_kwargs) == num_images
+    hf_processor = processor.info.get_hf_processor()
+    counts = []
+    for placeholder, item in zip(placeholders, image_kwargs, strict=True):
+        assert item is not None
+        pixels = item.get_data()["pixel_values"]
+        assert isinstance(pixels, torch.Tensor)
+        expected = _expected_placeholder_tokens_per_image(hf_processor, pixels)
+        assert placeholder.get_num_embeds() == expected
+        counts.append(expected)
+    image_id = processor.info.get_hf_config().image_token_index
+    assert output["prompt_token_ids"].count(image_id) == sum(counts)
+    return counts
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_images", [0, 1, 2])
+def test_mistral4_registry_dummy_uses_image_control_tokens(num_images: int):
+    """Startup profiling must find images when raw Tekken text cannot encode IMG."""
+    ctx = build_model_context(
+        _MISTRAL4_MODEL_ID,
+        model_config_kwargs={"config_format": "hf", "max_model_len": 8192},
+        limit_mm_per_prompt={"image": num_images},
+    )
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config)
+    assert isinstance(processor.info.get_tokenizer(), MistralTokenizer)
+    output = MULTIMODAL_REGISTRY.get_dummy_mm_inputs(
+        ctx.model_config,
+        mm_counts={"image": num_images},
+        processor=processor,
+    )
+    counts = _assert_image_features_match_placeholders(processor, output, num_images)
+    assert counts == [3025] * num_images
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("use_cache", [False, True])
+def test_mistral4_native_chat_images_use_hf_geometry_once(use_cache: bool):
+    """Preserve chat text while replacing native image grids with HF feature slots."""
+    ctx = build_model_context(
+        _MISTRAL4_MODEL_ID,
+        model_config_kwargs={"config_format": "hf", "max_model_len": 8192},
+        limit_mm_per_prompt={"image": 2},
+        mm_processor_cache_gb=int(use_cache),
+    )
+    cache = MultiModalProcessorOnlyCache(ctx.model_config) if use_cache else None
+    processor = MULTIMODAL_REGISTRY.create_processor(ctx.model_config, cache=cache)
+    tokenizer = processor.info.get_tokenizer()
+    assert isinstance(tokenizer, MistralTokenizer)
+    images = [Image.new("RGB", size) for size in ((29, 29), (56, 56))]
+    request = ChatCompletionRequest(
+        messages=[
+            UserMessage(
+                content=[
+                    TextChunk(text="Before: literal [IMG]. "),
+                    ImageChunk(image=images[0]),
+                    TextChunk(text=" Between: literal [IMG]. "),
+                    ImageChunk(image=images[1]),
+                    TextChunk(text=" After."),
+                ]
+            )
+        ]
+    )
+    native_prompt = tokenizer.mistral.encode_chat_completion(request).tokens
+    original_prompt = native_prompt.copy()
+    hf_processor = processor.info.get_hf_processor()
+    image_id = processor.info.get_hf_config().image_token_index
+    vocab = tokenizer.get_vocab()
+    control_ids = {
+        image_id,
+        vocab[hf_processor.image_break_token],
+        vocab[hf_processor.image_end_token],
+    }
+    assert native_prompt.count(image_id) == 8
+    assert image_id not in tokenizer.encode("[IMG]", add_special_tokens=False)
+    surrounding_tokens = [token for token in native_prompt if token not in control_ids]
+    inputs = ProcessorInputs(
+        prompt=native_prompt,
+        mm_data_items=processor.info.parse_mm_data({"image": images}),
+    )
+    first_prompt = None
+    for _ in range(2):
+        output = processor.apply(inputs, TimingContext(enabled=False))
+        _assert_image_features_match_placeholders(processor, output, 2)
+        output_prompt = output["prompt_token_ids"]
+        assert [token for token in output_prompt if token not in control_ids] == (
+            surrounding_tokens
+        )
+        if first_prompt is None:
+            first_prompt = output_prompt
+        else:
+            assert output_prompt == first_prompt
+        assert native_prompt == original_prompt

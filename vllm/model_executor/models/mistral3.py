@@ -32,6 +32,7 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
+    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
@@ -265,6 +266,29 @@ class Mistral3ProcessingInfo(BaseProcessingInfo):
 
 
 class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[Mistral3ProcessingInfo]):
+    def get_dummy_processor_inputs(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
+        mm_data: MultiModalDataDict | None = None,
+    ) -> ProcessorInputs:
+        tokenizer = self.info.get_tokenizer()
+        if not (isinstance(tokenizer, MistralTokenizer) and tokenizer.version >= 15):
+            return super().get_dummy_processor_inputs(seq_len, mm_counts, mm_options)
+
+        dummy_mm_data = (
+            self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+            if mm_data is None
+            else mm_data
+        )
+        # Raw Tekken text encoding does not recognize the [IMG] control token.
+        return ProcessorInputs(
+            prompt=[self.info.get_hf_config().image_token_index]
+            * mm_counts.get("image", 0),
+            mm_data_items=self.info.parse_mm_data(dummy_mm_data, validate=False),
+        )
+
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
 
@@ -296,6 +320,52 @@ class Mistral3DummyInputsBuilder(BaseDummyInputsBuilder[Mistral3ProcessingInfo])
 
 
 class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo]):
+    def _postprocess_prompt(self, prompt: list[int]) -> list[int]:
+        tokenizer = self.info.get_tokenizer()
+        if not (isinstance(tokenizer, MistralTokenizer) and tokenizer.version >= 15):
+            return prompt
+
+        processor = self.info.get_hf_processor()
+        vocab = tokenizer.get_vocab()
+        image_id = self.info.get_hf_config().image_token_index
+        break_id = vocab[processor.image_break_token]
+        end_id = vocab[processor.image_end_token]
+        if end_id not in prompt:
+            return prompt
+
+        # Native chat templates already expand images, potentially to a different
+        # grid than HF preprocessing. Restore one marker per complete image so
+        # the normal prompt updates can use the HF pixel geometry exactly once.
+        result: list[int] = []
+        start = 0
+        while start < len(prompt):
+            if prompt[start] != image_id:
+                result.append(prompt[start])
+                start += 1
+                continue
+
+            end = start + 1
+            while end < len(prompt) and prompt[end] in (image_id, break_id):
+                end += 1
+
+            complete = (
+                end < len(prompt)
+                and prompt[end] == end_id
+                and prompt[end - 1] == image_id
+                and all(
+                    prompt[i] != break_id or prompt[i - 1] == image_id
+                    for i in range(start + 1, end)
+                )
+            )
+            if complete:
+                result.append(image_id)
+                start = end + 1
+            else:
+                result.extend(prompt[start:end])
+                start = end
+
+        return result
+
     def _get_hf_processor_text(self, mm_counts: Mapping[str, int]) -> str:
         return self.dummy_inputs.get_dummy_text(mm_counts)
 
@@ -350,13 +420,24 @@ class Mistral3MultiModalProcessor(BaseMultiModalProcessor[Mistral3ProcessingInfo
         encoder_info = self.info.get_vision_encoder_info(hf_processor_mm_kwargs)
 
         def get_replacement(item_idx: int):
-            images = mm_items.get_items("image", ImageProcessorItems)
-            image_size = images.get_image_size(item_idx)
-
-            ncols, nrows = encoder_info.get_patch_grid_size(
-                image_width=image_size.width,
-                image_height=image_size.height,
-            )
+            image_data = out_mm_kwargs["image"][item_idx].get_data()
+            pixel_values = image_data.get("pixel_values")
+            if pixel_values is not None:
+                assert isinstance(pixel_values, torch.Tensor)
+                # Processor versions and resize options can align to different
+                # patch grids. Match the tensors actually sent to the projector.
+                height, width = pixel_values.shape[-2:]
+                merged_patch_size = (
+                    hf_config.vision_config.patch_size * hf_config.spatial_merge_size
+                )
+                ncols, nrows = width // merged_patch_size, height // merged_patch_size
+            else:
+                images = mm_items.get_items("image", ImageProcessorItems)
+                image_size = images.get_image_size(item_idx)
+                ncols, nrows = encoder_info.get_patch_grid_size(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                )
 
             tokens = ([image_token_id] * ncols + [image_break_id]) * nrows
             tokens[-1] = image_end_id
@@ -543,9 +624,12 @@ class Mistral3ForConditionalGeneration(
         if isinstance(image_features, torch.Tensor):
             return self.multi_modal_projector(image_features, image_sizes)
 
+        merged_patch_size = (
+            self.config.vision_config.patch_size * self.config.spatial_merge_size
+        )
         feature_sizes = [
-            image_feature.shape[0] // self.config.spatial_merge_size**2
-            for image_feature in image_features
+            (height // merged_patch_size) * (width // merged_patch_size)
+            for height, width in image_sizes
         ]
 
         image_embeds = self.multi_modal_projector(
